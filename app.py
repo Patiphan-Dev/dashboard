@@ -9,7 +9,7 @@ import pytz
 import streamlit as st
 import pandas as pd
 from streamlit_calendar import calendar
-from supabase import create_client
+from supabase import create_client, Client # 👈 ต้อง import Client ด้วย
 
 # -------------------
 # CONFIG / SECRETS
@@ -23,7 +23,14 @@ if not (SUPABASE_URL and SUPABASE_KEY and SUPABASE_BUCKET):
     st.error("Please set SUPABASE_URL, SUPABASE_KEY and SUPABASE_BUCKET in Streamlit secrets.")
     st.stop()
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# 👇 เพิ่ม Caching
+@st.cache_resource
+def init_connection(url: str, key: str) -> Client:
+    """Initializes and caches the Supabase client."""
+    return create_client(url, key)
+
+# ใช้ฟังก์ชัน Caching แทนการสร้าง client โดยตรง
+supabase = init_connection(SUPABASE_URL, SUPABASE_KEY) 
 
 # -------------------
 # Helpers - Supabase
