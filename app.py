@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, date
 import pytz
 import streamlit as st
-# from streamlit_calendar import calendar
+from streamlit_calendar import calendar
 import io, zipfile
 import pandas as pd
 from st_supabase_connection import SupabaseConnection
