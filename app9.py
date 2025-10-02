@@ -6,7 +6,8 @@ import streamlit as st
 from streamlit_calendar import calendar
 import io, zipfile
 import pandas as pd
-from sqlalchemy import text # NEW: ใช้สำหรับ INSERT/DELETE
+from sqlalchemy import text # ใช้สำหรับ DML ใน PostgreSQL
+from supabase import create_client, Client # 🆕 Import Supabase Client สำหรับ Storage
 
 # ====== IMPORT ANALYZERS ======
 from CPU_Analyzer import CPU_Analyzer
@@ -24,30 +25,73 @@ from table1 import SummaryTableReport
 st.set_page_config(layout="wide")
 pd.set_option("styler.render.max_elements", 1_200_000)
 
-# ⚠️ UPLOAD_DIR ยังคงมี แต่เราจะไม่ใช้ Disk I/O อีก
+# UPLOAD_DIR และ DB_FILE เดิมถูกยกเลิกการใช้งานแล้ว
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-# ====== DB INIT / CONNECTION (ใช้ Streamlit Connection API) ======
+# ====== DB INIT / CONNECTION & SUPABASE CLIENT INIT ======
+
+# 1. SQL Connection (สำหรับ PostgreSQL Metadata Table)
 try:
-    # ใช้ชื่อมาตรฐาน "supabase" (ต้องตรงกับ Secrets ที่ตั้งไว้)
     conn = st.connection("supabase", type="sql")
 except Exception as e:
-    # หากเชื่อมต่อไม่ได้ จะแสดง Error เพื่อให้ผู้ใช้ตรวจสอบ secrets
-    st.error(f"Failed to connect to Supabase. Error: {e}")
+    st.error(f"Failed to connect to Supabase SQL. Error: {e}")
     conn = None 
 
+# 2. Supabase Client (สำหรับ Storage)
+# 🆕 ดึงค่าจาก Streamlit Secrets
+try:
+    SUPABASE_URL = st.secrets.supabase_client.url
+    SUPABASE_KEY = st.secrets.supabase_client.anon_key
+    BUCKET_NAME = st.secrets.supabase_client.bucket_name
+except AttributeError:
+    st.error("Please configure [supabase_client] secrets (url, anon_key, bucket_name).")
+    SUPABASE_URL, SUPABASE_KEY, BUCKET_NAME = None, None, None
 
-# ====== DB FUNCTIONS (Cloud-Safe: บันทึกเฉพาะ Metadata) ======
-def save_file_metadata_only(upload_date: str, file_name: str):
-    """บันทึก Metadata ลง Supabase (ไม่บันทึกไฟล์จริงลงดิสก์)"""
-    if conn is None:
+
+@st.cache_resource
+def init_supabase_storage_client() -> Client:
+    """สร้าง Supabase Client สำหรับ Storage API"""
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            return create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as e:
+            st.error(f"Failed to initialize Supabase Storage Client: {e}")
+            return None
+    return None
+
+supabase_client = init_supabase_storage_client()
+# -----------------------------------------------------------
+
+
+# ====== DB/STORAGE FUNCTIONS (Cloud Persistence) ======
+
+def save_file_to_storage(upload_date: str, file):
+    """บันทึกไฟล์ลง Supabase Storage และ Metadata ลง PostgreSQL"""
+    if conn is None or supabase_client is None:
+        st.warning("Cannot save file: Supabase connection or client is not available.")
         return
 
-    current_time_str = datetime.now(pytz.timezone("Asia/Bangkok")).isoformat()
+    # 1. บันทึกไฟล์ลง Supabase Storage
+    file_id = str(uuid.uuid4())
+    stored_name = f"{file_id}_{file.name}"
+    # Path ใน Storage: analysis_zips/YYYY-MM-DD/uuid_filename
+    storage_path = f"{upload_date}/{stored_name}"
 
-    # ใช้ session.execute สำหรับ INSERT (แก้ ResourceClosedError)
+    try:
+        # Upload file bytes to Storage
+        supabase_client.storage.from_(BUCKET_NAME).upload(
+            file=file.getbuffer(), 
+            path=storage_path, 
+            file_options={"content-type": "application/zip"} # กำหนด MIME Type
+        )
+    except Exception as e:
+        st.error(f"Error uploading file '{file.name}' to Supabase Storage: {e}")
+        return
+
+    # 2. บันทึก Metadata ลง PostgreSQL
+    current_time_str = datetime.now(pytz.timezone("Asia/Bangkok")).isoformat()
     with conn.session as session:
         session.execute(
             text(
@@ -58,49 +102,90 @@ def save_file_metadata_only(upload_date: str, file_name: str):
             ), 
             params={
                 "upload_date": upload_date, 
-                "orig_filename": file_name, 
-                # เก็บ path เป็น dummy เพื่อให้ schema เดิมใช้งานได้
-                "stored_path": f"CLOUD_ONLY_{str(uuid.uuid4())}", 
+                "orig_filename": file.name, 
+                "stored_path": storage_path, # ⬅️ ใช้ Storage Path
                 "created_at": current_time_str
             }
         )
         session.commit()
         
-# ⚠️ ฟังก์ชัน list_files_by_date และ delete_file ถูกลบออก
-# ⚠️ เนื่องจากไฟล์จริงที่อ้างถึงด้วย stored_path จะไม่สามารถดึงกลับมาได้แล้ว
-# ⚠️ และเราเปลี่ยนไปใช้การวิเคราะห์ไฟล์ที่เพิ่งอัปโหลดทันที
+@st.cache_data(ttl="1h")
+def list_files_by_date(upload_date: str):
+    """ดึงรายการไฟล์ทั้งหมดตามวันที่จาก PostgreSQL (Metadata)"""
+    if conn is None: return []
+    df = conn.query(
+        "SELECT id, orig_filename, stored_path FROM uploads WHERE upload_date = :upload_date ORDER BY created_at DESC", 
+        params={"upload_date": upload_date},
+        ttl="1h"
+    )
+    # คืนค่าเป็น list of tuples (id, orig_filename, stored_path)
+    return list(df[['id', 'orig_filename', 'stored_path']].itertuples(index=False, name=None))
+
+
+@st.cache_data(ttl=600) # Cache 10 นาที
+def get_file_bytes_from_storage(storage_path: str):
+    """ดึงไฟล์ bytes จาก Supabase Storage"""
+    if supabase_client is None:
+        return None
+    try:
+        # ดาวน์โหลดไฟล์
+        res = supabase_client.storage.from_(BUCKET_NAME).download(storage_path)
+        return io.BytesIO(res)
+    except Exception as e:
+        st.error(f"Error downloading file '{storage_path}' from Storage: {e}")
+        return None
+
+
+def delete_file(file_id: int):
+    """ลบไฟล์ออกจาก Storage และลบ Metadata ออกจาก PostgreSQL"""
+    if conn is None or supabase_client is None: return
+        
+    # 1. ดึง stored_path (Storage Path)
+    df_path = conn.query("SELECT stored_path FROM uploads WHERE id = :id", params={"id": file_id}, ttl="1h")
+    if df_path.empty: return
+        
+    storage_path = df_path['stored_path'].iloc[0]
+
+    # 2. ลบไฟล์จาก Supabase Storage
+    try:
+        # การลบต้องใช้ list ของ path
+        supabase_client.storage.from_(BUCKET_NAME).remove([storage_path]) 
+    except Exception as e:
+        st.warning(f"Failed to delete file from Storage: {e}. Metadata will still be removed.")
+
+    # 3. ลบ metadata จาก PostgreSQL
+    with conn.session as session:
+        session.execute(text("DELETE FROM uploads WHERE id = :id"), params={"id": file_id})
+        session.commit()
 
 @st.cache_data(ttl="1h")
 def list_dates_with_files():
     """ดึงวันที่และจำนวนไฟล์ทั้งหมดจาก Supabase สำหรับ Calendar"""
-    if conn is None:
-        return []
+    if conn is None: return []
 
-    # ดึงข้อมูลวันที่และจำนวนไฟล์
     df = conn.query(
         "SELECT upload_date, COUNT(id) as count FROM uploads GROUP BY upload_date",
+        ttl="1h"
     )
-    # แปลง DataFrame เป็น list of tuples (upload_date, count)
     return list(df.itertuples(index=False, name=None))
+# -----------------------------------------------------------
 
 
 # ====== CLEAR SESSION & ZIP PARSER (คงเดิม) ======
 def clear_all_uploaded_data():
-    st.session_state.clear()
-
-
+    # ล้างสถานะการวิเคราะห์ทั้งหมด
+    keys_to_clear = [k for k in st.session_state.keys() if k.endswith(("_data", "_file", "wason_log", "analyzer", "lb_pmap", "zip_loaded"))]
+    for key in keys_to_clear:
+        del st.session_state[key]
+    st.session_state["zip_loaded"] = False
+    
 # ====== ZIP PARSER (คงเดิม) ======
 KW = {
-    "cpu": ("cpu",),
-    "fan": ("fan",),
-    "msu": ("msu",),
-    "client": ("client", "client board"),
-    "line": ("line","line board"),
-    "wason": ("wason","log"), 
-    "osc": ("osc","osc optical"),
+    "cpu": ("cpu",), "fan": ("fan",), "msu": ("msu",),
+    "client": ("client", "client board"), "line": ("line","line board"),
+    "wason": ("wason","log"), "osc": ("osc","osc optical"),
     "fm": ("fm","alarm","fault management"),
-    "atten": ("optical attenuation report", "optical_attenuation_report"),
-    "atten": ("optical attenuation report","optical attenuation"),
+    "atten": ("optical attenuation report", "optical_attenuation_report", "optical attenuation"),
     "preset": ("mobaxterm", "moba xterm", "moba"),
 }
 
@@ -117,22 +202,11 @@ def _ext(name: str) -> str:
 def _kind(name):
     n = name.lower()
     hits = [k for k, kws in KW.items() if any(s in n for s in kws)]
-
-    # ---- Priority ----
-    if "wason" in hits:
-        return "wason"
-    if "preset" in hits:
-        return "preset"
-
-    # ---- เช็คว่า line ต้องเป็น Excel เท่านั้น ----
-    if "line" in hits and (n.endswith(".xlsx") or n.endswith(".xls") or n.endswith(".xlsm")):
-        return "line"
-
-    # ---- อื่น ๆ ตามปกติ ----
+    if "wason" in hits: return "wason"
+    if "preset" in hits: return "preset"
+    if "line" in hits and (n.endswith(".xlsx") or n.endswith(".xls") or n.endswith(".xlsm")): return "line"
     for k in ("fan","cpu","msu","client","osc","fm","atten"):
-        if k in hits:
-            return k
-
+        if k in hits: return k
     return hits[0] if hits else None
 
 
@@ -140,34 +214,22 @@ def find_in_zip(zip_file):
     found = {k: None for k in KW}
     def walk(zf):
         for name in zf.namelist():
-            if all(found.values()): 
-                return
-            if name.endswith("/"): 
-                continue
+            if all(found.values()): return
+            if name.endswith("/"): continue
             lname = name.lower()
             if lname.endswith(".zip"):
                 try:
                     walk(zipfile.ZipFile(io.BytesIO(zf.read(name))))
-                except:
-                    pass
+                except: pass
                 continue
             ext = _ext(lname)
             kind = _kind(lname)
-            if not ext or not kind or found[kind]:
-                continue
+            if not ext or not kind or found[kind]: continue
             try:
                 with zf.open(name) as f:
-                    # ใช้ LOADERS[ext](f) จาก Bytes โดยตรง
-                    df = LOADERS[ext](f) 
-                    print("DEBUG LOADED:", kind, type(df), name)
-
-                if kind == "wason":
-                    found[kind] = (df, name) 
-                else:
-                    found[kind] = (df, name) 
-
-            except:
-                continue
+                    df = LOADERS[ext](f)
+                found[kind] = (df, name) 
+            except: continue
     try:
         walk(zipfile.ZipFile(zip_file))
     except Exception as e:
@@ -189,10 +251,10 @@ menu = st.sidebar.radio("เลือกกิจกรรม", [
 ])
 
 
-# ====== หน้าแรก (Calendar Upload + Run Analysis ทันที) ======
+# ====== หน้าแรก (Calendar Upload + Run Analysis + Delete) ======
 if menu == "หน้าแรก":
     st.subheader("DWDM Monitoring Dashboard")
-    st.markdown("#### Upload & Run Analysis (Cloud-Safe)")
+    st.markdown("#### Upload & Manage ZIP Files (Cloud Persistent)")
 
     chosen_date = st.date_input("Select date", value=date.today())
     files = st.file_uploader(
@@ -201,64 +263,24 @@ if menu == "หน้าแรก":
         accept_multiple_files=True,
         key=f"uploader_{chosen_date}"
     )
-
-    # 1. รัน Analysis ทันทีที่กดปุ่ม
-    if st.button("Run Analysis", key="analyze_btn_upload_page"):
-        if not files:
-            st.warning("Please upload at least one ZIP file to analyze.")
-        else:
-            clear_all_uploaded_data()
-            total = 0
-            
-            # เก็บข้อมูลไฟล์ทั้งหมดใน session state เพื่อใช้ในหน้าอื่น
-            st.session_state["uploaded_file_info"] = [] 
-
-            with st.spinner(f"Analyzing {len(files)} files..."):
+    if files:
+        if st.button("Upload", key=f"upload_btn_{chosen_date}"):
+            if supabase_client is None:
+                st.error("Cannot upload. Supabase Storage client is not initialized.")
+            else:
                 for file in files:
-                    # 1. บันทึก Metadata (สำหรับ Calendar)
-                    save_file_metadata_only(str(chosen_date), file.name)
-                    
-                    # 2. ทำ Analysis จาก Bytes โดยตรง (แก้ FileNotFoundError)
-                    zip_bytes = io.BytesIO(file.getbuffer())
-                    res = find_in_zip(zip_bytes)
-                    
-                    for kind, pack in res.items():
-                        if not pack:
-                            continue
-                        df, zname = pack
-                        if kind == "wason":
-                            st.session_state["wason_log"] = df 
-                            st.session_state["wason_file"] = zname
-                        else:
-                            st.session_state[f"{kind}_data"] = df 
-                            st.session_state[f"{kind}_file"] = zname
-                    
-                    total += 1
-                    st.session_state["uploaded_file_info"].append(file.name)
+                    save_file_to_storage(str(chosen_date), file)
+                st.success(f"Upload completed ({len(files)} file(s))")
+                st.rerun()
 
-            st.session_state["zip_loaded"] = True
-            st.success(f"✅ Analysis finished. Processed {total} file(s).")
-            st.rerun() # reruns เพื่อให้ Calendar อัปเดต
-
-    st.subheader("Calendar (Date History)")
-    
+    st.subheader("Calendar")
     events = []
-    # ใช้ list_dates_with_files ที่เชื่อมต่อ Supabase แล้ว
     for d, cnt in list_dates_with_files():
-        events.append({
-            "title": f"{cnt} upload(s)",
-            "start": d,
-            "allDay": True,
-            "color": "blue"
-        })
+        events.append({"title": f"{cnt} file(s)", "start": d, "allDay": True, "color": "blue"})
 
     calendar_res = calendar(
         events=events,
-        options={
-            "initialView": "dayGridMonth",
-            "height": "400px",
-            "selectable": True,
-        },
+        options={"initialView": "dayGridMonth", "height": "400px", "selectable": True},
         key="calendar",
     )
 
@@ -274,15 +296,62 @@ if menu == "หน้าแรก":
 
     if clicked_date:
         st.session_state["selected_date"] = clicked_date
+
+    selected_date = st.session_state["selected_date"]
+
+    st.subheader(f"Files for {selected_date}")
+    # ดึง metadata จาก DB
+    files_list = list_files_by_date(selected_date)
     
-    # แสดงรายการไฟล์ที่เพิ่งวิเคราะห์ไป
-    if st.session_state.get("uploaded_file_info"):
-        st.subheader("Last Analyzed Files:")
-        for name in st.session_state["uploaded_file_info"]:
-            st.markdown(f"- **{name}**")
+    if not files_list:
+        st.info("No files for this date")
+    else:
+        selected_files_meta = [] # (fid, fname, storage_path)
+        for fid, fname, fpath in files_list:
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                checked = st.checkbox(fname, key=f"chk_{fid}")
+                if checked:
+                    selected_files_meta.append((fid, fname, fpath))
+            with col2:
+                if st.button("Delete", key=f"del_{fid}"):
+                    delete_file(fid) # ⬅️ ลบจาก Storage และ DB
+                    st.rerun()
+
+        
+        if st.button("Run Analysis", key="analyze_btn"):
+            if not selected_files_meta:
+                st.warning("Please select at least one file to analyze")
+            else:
+                clear_all_uploaded_data()
+                total = 0
+                
+                with st.spinner("Downloading files and running analysis..."):
+                    for fid, fname, fpath in selected_files_meta:
+                        # ⚠️ ดาวน์โหลดไฟล์จาก Storage (fpath = storage_path)
+                        zip_bytes = get_file_bytes_from_storage(fpath)
+                        if zip_bytes is None:
+                            continue # ข้ามถ้าดาวน์โหลดไม่ได้
+
+                        res = find_in_zip(zip_bytes) # ⬅️ ทำ Analysis จาก Bytes ที่โหลดมา
+
+                        for kind, pack in res.items():
+                            if not pack: continue
+                            df, zname = pack
+                            if kind == "wason":
+                                st.session_state["wason_log"] = df 
+                                st.session_state["wason_file"] = zname
+                            else:
+                                st.session_state[f"{kind}_data"] = df 
+                                st.session_state[f"{kind}_file"] = zname
+                        
+                        total += 1
+
+                st.session_state["zip_loaded"] = True
+                st.success(f"✅ Analysis finished. Processed {total} file(s).")
 
 
-# ====== เมนูอื่น ๆ (คงเดิม) ======
+# ====== เมนูอื่น ๆ (Analyzer Modules - คงเดิม) ======
 
 elif menu == "CPU":
     if st.session_state.get("cpu_data") is not None:
@@ -295,11 +364,10 @@ elif menu == "CPU":
             )
             analyzer.process()
             st.session_state["cpu_analyzer"] = analyzer 
-            # แสดงผล
         except Exception as e:
             st.error(f"An error occurred during processing: {e}")
     else:
-        st.info("Please upload file to start the analysis")
+        st.info("Please run analysis on 'หน้าแรก' to load file data.")
 
 
 elif menu == "FAN":
@@ -309,16 +377,14 @@ elif menu == "FAN":
             analyzer = FAN_Analyzer(
                 df_fan=safe_copy(st.session_state.get("fan_data")),
                 df_ref=df_ref.copy(),
-                ns="fan" # namespace สำหรับ cascading_filter
+                ns="fan"
             )
             analyzer.process()
             st.session_state["fan_analyzer"] = analyzer
-            st.write("DEBUG set fan_analyzer", st.session_state["fan_analyzer"])
-            # แสดงผล
         except Exception as e:
             st.error(f"An error occurred during processing: {e}")
     else:
-        st.info("Please upload a FAN file to start the analysis")
+        st.info("Please run analysis on 'หน้าแรก' to load file data.")
 
 
 elif menu == "MSU":
@@ -332,20 +398,16 @@ elif menu == "MSU":
             )
             analyzer.process()
             st.session_state["msu_analyzer"] = analyzer
-            # แสดงผล
         except Exception as e:
             st.error(f"An error occurred during processing: {e}")
     else:
-        st.info("Please upload an MSU file to start the analysis")
+        st.info("Please run analysis on 'หน้าแรก' to load file data.")
 
 
 elif menu == "Line board":
     st.markdown("### Line Cards Performance")
-
-    df_line = st.session_state.get("line_data") # ✅ DataFrame
-    log_txt = st.session_state.get("wason_log") # ✅ String
-
-    # gen pmap จาก TXT ถ้ามี
+    df_line = st.session_state.get("line_data") 
+    log_txt = st.session_state.get("wason_log") 
     if log_txt:
         st.session_state["lb_pmap"] = Line_Analyzer.get_preset_map(log_txt)
     pmap = st.session_state.get("lb_pmap", {})
@@ -354,7 +416,7 @@ elif menu == "Line board":
         try:
             df_ref = pd.read_excel("data/Line.xlsx")
             analyzer = Line_Analyzer(
-                df_line=df_line.copy(), # ✅ ต้องเป็น DataFrame
+                df_line=df_line.copy(), 
                 df_ref=df_ref.copy(),
                 pmap=pmap,
                 ns="line",
@@ -364,50 +426,43 @@ elif menu == "Line board":
                 f"Using LINE file: {st.session_state.get('line_file')}"
                 f"{'(with WASON log)' if log_txt else '(no WASON log)'}"
             )
-            # แสดงผล
         except Exception as e:
             st.error(f"An error occurred during processing: {e}")
     else:
-        st.info("Please upload a ZIP on 'หน้าแรก' that contains a Line workbook")
+        st.info("Please run analysis on 'หน้าแรก' to load file data.")
 
 
 elif menu == "Client board":
     st.markdown("### Client Board")
     if st.session_state.get("client_data") is not None:
         try:
-            # โหลด Reference
             df_ref = pd.read_excel("data/Client.xlsx")
-            
-            # สร้าง Analyzer
             analyzer = Client_Analyzer(
                 df_client=st.session_state.client_data.copy(),
-                ref_path="data/Client.xlsx" # ✅ ให้ class โหลดเอง
+                ref_path="data/Client.xlsx"
             )
             analyzer.process()
             st.session_state["client_analyzer"] = analyzer
             st.caption(f"Using CLIENT file: {st.session_state.get('client_file')}")
-            # แสดงผล
         except Exception as e:
             st.error(f"An error occurred during processing: {e}")
     else:
-        st.info("Please upload a ZIP on 'หน้าแรก' that contains a Client workbook")
+        st.info("Please run analysis on 'หน้าแรก' to load file data.")
 
 
 elif menu == "Fiber Flapping":
     st.markdown("### Fiber Flapping (OSC + FM)")
-
-    df_osc = st.session_state.get("osc_data") # จาก ZIP: .xlsx → DataFrame
-    df_fm = st.session_state.get("fm_data") # จาก ZIP: .xlsx → DataFrame
+    df_osc = st.session_state.get("osc_data") 
+    df_fm = st.session_state.get("fm_data") 
 
     if (df_osc is not None) and (df_fm is not None):
         try:
             analyzer = FiberflappingAnalyzer(
                 df_optical=df_osc.copy(),
                 df_fm=df_fm.copy(),
-                threshold=2.0, # คงเดิม
+                threshold=2.0, 
             )
             analyzer.process()
-            # แสดงผล
             st.caption(
                 f"Using OSC: {st.session_state.get('osc_file')} | "
                 f"FM: {st.session_state.get('fm_file')}"
@@ -415,12 +470,12 @@ elif menu == "Fiber Flapping":
         except Exception as e:
             st.error(f"An error occurred: {e}")
     else:
-        st.info("Please upload a ZIP on 'หน้าแรก' that contains both OSC (optical) and FM workbooks.")
+        st.info("Please run analysis on 'หน้าแรก' to load file data.")
 
 
 elif menu == "Loss between EOL":
     st.markdown("### Loss between EOL")
-    df_raw = st.session_state.get("atten_data") # ใช้ atten_data ที่โหลดมา
+    df_raw = st.session_state.get("atten_data") 
     if df_raw is not None:
         try:
             analyzer = EOLAnalyzer(
@@ -428,19 +483,18 @@ elif menu == "Loss between EOL":
                 df_raw_data=df_raw.copy(),
                 ref_path="data/EOL.xlsx",
             )
-            analyzer.process() # ⬅ ตรงนี้ทำให้โชว์ทันที
+            analyzer.process() 
             st.session_state["eol_analyzer"] = analyzer
             st.caption(f"Using RAW file: {st.session_state.get('atten_file')}")
-            # แสดงผล
         except Exception as e:
             st.error(f"An error occurred during EOL analysis: {e}")
     else:
-        st.info("Please upload a ZIP file that contains the attenuation report.")
+        st.info("Please run analysis on 'หน้าแรก' to load file data.")
 
 
 elif menu == "Loss between Core":
     st.markdown("### Loss between Core")
-    df_raw = st.session_state.get("atten_data") # ใช้ atten_data เหมือนกัน
+    df_raw = st.session_state.get("atten_data")
     if df_raw is not None:
         try:
             analyzer = CoreAnalyzer(
@@ -448,14 +502,13 @@ elif menu == "Loss between Core":
                 df_raw_data=df_raw.copy(),
                 ref_path="data/EOL.xlsx",
             )
-            analyzer.process() # ⬅ ตรงนี้ทำให้โชว์ทันที
+            analyzer.process() 
             st.session_state["core_analyzer"] = analyzer
             st.caption(f"Using RAW file: {st.session_state.get('atten_file')}")
-            # แสดงผล
         except Exception as e:
             st.error(f"An error occurred during Core analysis: {e}")
     else:
-        st.info("Please upload a ZIP file that contains the attenuation report.")
+        st.info("Please run analysis on 'หน้าแรก' to load file data.")
 
 
 elif menu == "Summary table & report":

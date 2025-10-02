@@ -21,4 +21,8 @@ plotly
 # ====== NEW ADDITION ======
 # Library ที่ขาดไปสำหรับ report.py (ใช้สร้าง PDF Report)
 reportlab
+
+# NEW: สำหรับการใช้งาน Supabase Storage/Client
+supabase-py
+
 # ==========================
