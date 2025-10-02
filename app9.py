@@ -31,9 +31,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ====== DB INIT / CONNECTION (ใช้ Streamlit Connection API) ======
 try:
-    # 'supabase' คือชื่อที่ตั้งใน [connections.supabase] ในไฟล์ secrets.toml
-    # type="sql" สำหรับ PostgreSQL/Supabase
-    conn = st.connection("supabase", type="sql")
+    # เปลี่ยนชื่อจาก "supabase" เป็น "supabase_url"
+    conn = st.connection("supabase_url", type="sql")
 except Exception as e:
     # หากเชื่อมต่อไม่ได้ จะแสดง Error เพื่อให้ผู้ใช้ตรวจสอบ secrets
     st.error(f"Failed to connect to Supabase. Error: {e}")
