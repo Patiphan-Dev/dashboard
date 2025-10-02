@@ -31,13 +31,12 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ====== DB INIT / CONNECTION (ใช้ Streamlit Connection API) ======
 try:
-    # เปลี่ยนชื่อจาก "supabase" เป็น "supabase_url"
-    conn = st.connection("supabase_url", type="sql")
+   # ใช้ชื่อมาตรฐาน "supabase"
+   conn = st.connection("supabase", type="sql")
 except Exception as e:
-    # หากเชื่อมต่อไม่ได้ จะแสดง Error เพื่อให้ผู้ใช้ตรวจสอบ secrets
-    st.error(f"Failed to connect to Supabase. Error: {e}")
-    conn = None 
-
+   # หากเชื่อมต่อไม่ได้ จะแสดง Error เพื่อให้ผู้ใช้ตรวจสอบ secrets
+   st.error(f"Failed to connect to Supabase. Error: {e}")
+   conn = None
 # def init_db(): ❌ ลบออก
 #     ...
 # init_db() ❌ ลบออก
