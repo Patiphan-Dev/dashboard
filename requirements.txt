@@ -15,9 +15,10 @@ pytz
 # Library สำหรับ Calendar Component
 streamlit-calendar
 
-# ====== NEW ADDITION ======
-# Library ที่ขาดไปสำหรับ Line_Analyzer.py
+# Library สำหรับ Plotting (ที่เพิ่มเมื่อคำตอบที่แล้ว)
 plotly 
-# ==========================
 
-# หากมี Library อื่น ๆ ที่ใช้ในไฟล์ Analyzer อื่น ๆ ให้เพิ่มลงไปตรงนี้ด้วย
+# ====== NEW ADDITION ======
+# Library ที่ขาดไปสำหรับ report.py (ใช้สร้าง PDF Report)
+reportlab
+# ==========================
