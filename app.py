@@ -50,10 +50,12 @@ def init_supabase() -> (Client, str, str):
 # 💡 NEW: รับค่าที่ส่งคืนกลับมาเป็นตัวแปร Global
 try:
     supabase, SB_TABLE, SB_BUCKET = init_supabase()
+    # 💡 NEW DEBUG: ตรวจสอบการเชื่อมต่อกับตาราง
+    st.sidebar.success(f"Supabase Client Initialized: {SB_TABLE}") 
+    
 except Exception as e:
-    st.error("🚨 Error Initializing Supabase Connection. Check your .streamlit/secrets.toml file.")
+    st.sidebar.error("🚨 Error Initializing Supabase Connection. Check your .streamlit/secrets.toml file.")
     st.stop()
-
 
 # ====== DB FUNCTIONS (SUPABASE) ======
 def save_file(upload_date: str, file):
