@@ -7,6 +7,7 @@ import streamlit as st
 from streamlit_calendar import calendar
 import io, zipfile
 import pandas as pd
+from sqlalchemy import text # ⬅️ NEW: ต้องใช้ text() ในการ execute DML
 
 # ====== IMPORT ANALYZERS ======
 from CPU_Analyzer import CPU_Analyzer
@@ -31,12 +32,13 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ====== DB INIT / CONNECTION (ใช้ Streamlit Connection API) ======
 try:
-   # ใช้ชื่อมาตรฐาน "supabase"
-   conn = st.connection("supabase", type="sql")
+    # ใช้ชื่อมาตรฐาน "supabase" และ Session Pooler (ตามที่ตั้งค่า Secrets ล่าสุด)
+    conn = st.connection("supabase", type="sql")
 except Exception as e:
-   # หากเชื่อมต่อไม่ได้ จะแสดง Error เพื่อให้ผู้ใช้ตรวจสอบ secrets
-   st.error(f"Failed to connect to Supabase. Error: {e}")
-   conn = None
+    # หากเชื่อมต่อไม่ได้ จะแสดง Error เพื่อให้ผู้ใช้ตรวจสอบ secrets
+    st.error(f"Failed to connect to Supabase. Error: {e}")
+    conn = None 
+
 # def init_db(): ❌ ลบออก
 #     ...
 # init_db() ❌ ลบออก
@@ -57,26 +59,30 @@ def save_file(upload_date: str, file):
     with open(stored_path, "wb") as f:
         f.write(file.getbuffer())
 
-    # 2. บันทึก Metadata ลง Supabase
+    # 2. บันทึก Metadata ลง Supabase (FIX: ใช้ session.execute สำหรับ INSERT)
     current_time_str = datetime.now(pytz.timezone("Asia/Bangkok")).isoformat()
 
-    conn.query(
-        """
-        INSERT INTO uploads (upload_date, orig_filename, stored_path, created_at)
-        VALUES (:upload_date, :orig_filename, :stored_path, :created_at)
-        """, 
-        params={
-            "upload_date": upload_date, 
-            "orig_filename": file.name, 
-            "stored_path": stored_path, 
-            "created_at": current_time_str
-        },
-        ttl=0 # ไม่แคชการเขียนข้อมูล
-    )
+    with conn.session as session:
+        session.execute(
+            text(
+                """
+                INSERT INTO uploads (upload_date, orig_filename, stored_path, created_at)
+                VALUES (:upload_date, :orig_filename, :stored_path, :created_at)
+                """
+            ), 
+            params={
+                "upload_date": upload_date, 
+                "orig_filename": file.name, 
+                "stored_path": stored_path, 
+                "created_at": current_time_str
+            }
+        )
+        session.commit() # ต้อง commit ด้วย
+        
 
 @st.cache_data(ttl="1h")
 def list_files_by_date(upload_date: str):
-    """ดึงรายการไฟล์ทั้งหมดตามวันที่จาก Supabase"""
+    """ดึงรายการไฟล์ทั้งหมดตามวันที่จาก Supabase (SELECT ยังคงใช้ conn.query)"""
     if conn is None:
         return []
 
@@ -93,7 +99,7 @@ def delete_file(file_id: int):
     if conn is None:
         return
         
-    # 1. ดึง stored_path เพื่อลบไฟล์จากดิสก์ชั่วคราว
+    # 1. ดึง stored_path เพื่อลบไฟล์จากดิสก์ชั่วคราว (ใช้ conn.query)
     df_path = conn.query(
         "SELECT stored_path FROM uploads WHERE id = :id",
         params={"id": file_id},
@@ -106,16 +112,17 @@ def delete_file(file_id: int):
         except FileNotFoundError:
             pass 
 
-    # 2. ลบ metadata จาก Supabase
-    conn.query(
-        "DELETE FROM uploads WHERE id = :id", 
-        params={"id": file_id},
-        ttl=0
-    )
+    # 2. ลบ metadata จาก Supabase (FIX: ใช้ session.execute สำหรับ DELETE)
+    with conn.session as session:
+        session.execute(
+            text("DELETE FROM uploads WHERE id = :id"), 
+            params={"id": file_id}
+        )
+        session.commit() # ต้อง commit ด้วย
 
 @st.cache_data(ttl="1h")
 def list_dates_with_files():
-    """ดึงวันที่และจำนวนไฟล์ทั้งหมดจาก Supabase สำหรับ Calendar"""
+    """ดึงวันที่และจำนวนไฟล์ทั้งหมดจาก Supabase สำหรับ Calendar (SELECT ยังคงใช้ conn.query)"""
     if conn is None:
         return []
 
@@ -416,7 +423,6 @@ elif menu == "Line board":
         st.info("Please upload a ZIP on 'หน้าแรก' that contains a Line workbook")
 
 
-
 elif menu == "Client board":
     st.markdown("### Client Board")
     if st.session_state.get("client_data") is not None:
@@ -462,7 +468,6 @@ elif menu == "Fiber Flapping":
         st.info("Please upload a ZIP on 'หน้าแรก' that contains both OSC (optical) and FM workbooks.")
 
 
-
 elif menu == "Loss between EOL":
     st.markdown("### Loss between EOL")
     df_raw = st.session_state.get("atten_data") # ใช้ atten_data ที่โหลดมา
@@ -499,7 +504,6 @@ elif menu == "Loss between Core":
             st.error(f"An error occurred during Core analysis: {e}")
     else:
         st.info("Please upload a ZIP file that contains the attenuation report.")
-
 
 
 elif menu == "Summary table & report":
