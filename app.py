@@ -12,8 +12,7 @@ import postgrest # สำหรับจัดการ Error ของ Supabase
 from supabase import create_client, Client
 
 
-# ====== IMPORT ANALYZERS ======
-# ตรวจสอบให้แน่ใจว่าไฟล์เหล่านี้อยู่ใน Project ของคุณ
+# ====== IMPORT ANALYZERS (etc.) ======
 from CPU_Analyzer import CPU_Analyzer
 from FAN_Analyzer import FAN_Analyzer
 from MSU_Analyzer import MSU_Analyzer
@@ -29,59 +28,57 @@ from table1 import SummaryTableReport
 st.set_page_config(layout="wide")
 pd.set_option("styler.render.max_elements", 1_200_000)
 
-# ❌ ลบการตั้งค่า Local Disk และ SQLite
-# UPLOAD_DIR = "uploads"
-# os.makedirs(UPLOAD_DIR, exist_ok=True)
-# DB_FILE = "files.db"
-
 
 # ====== DB INIT (SUPABASE) ======
-# 💡 ใช้ @st.cache_resource เพื่อสร้าง Supabase Client เพียงครั้งเดียว
+# 💡 แก้ไข: ฟังก์ชันนี้จะคืนค่า Client และชื่อ Table/Bucket เป็นตัวแปร Global
 @st.cache_resource
-def init_supabase() -> Client:
+def init_supabase() -> (Client, str, str):
     # ดึงค่าจาก .streamlit/secrets.toml
     url = st.secrets.SUPABASE_URL
     key = st.secrets.SUPABASE_KEY
     
-    # กำหนดชื่อ Table และ Bucket จาก secrets
-    st.session_state["SB_TABLE"] = "uploads" # ชื่อ Table ใน Supabase DB
-    st.session_state["SB_BUCKET"] = st.secrets.SUPABASE_BUCKET # ชื่อ Bucket ใน Supabase Storage
+    # กำหนดค่าคงที่ Global
+    SB_TABLE = "uploads" # ชื่อ Table ใน Supabase DB
+    SB_BUCKET = st.secrets.SUPABASE_BUCKET # ชื่อ Bucket ใน Supabase Storage
     
     # สร้าง Client และเชื่อมต่อ
     supabase: Client = create_client(url, key)
-    return supabase
+    
+    # ส่งคืน Client และชื่อ Table/Bucket
+    return supabase, SB_TABLE, SB_BUCKET
 
-# 💡 เรียกใช้ init_supabase
-supabase = init_supabase()
+# 💡 NEW: รับค่าที่ส่งคืนกลับมาเป็นตัวแปร Global
+try:
+    supabase, SB_TABLE, SB_BUCKET = init_supabase()
+except Exception as e:
+    st.error("🚨 Error Initializing Supabase Connection. Check your .streamlit/secrets.toml file.")
+    st.stop()
 
 
 # ====== DB FUNCTIONS (SUPABASE) ======
 def save_file(upload_date: str, file):
     """บันทึกไฟล์ไปที่ Supabase Storage และ Metadata ไปที่ Supabase DB"""
-    table_name = st.session_state.SB_TABLE
-    bucket_name = st.session_state.SB_BUCKET
+    # 💡 ใช้ตัวแปร Global
+    table_name = SB_TABLE
+    bucket_name = SB_BUCKET
     file_id = str(uuid.uuid4())
     orig_filename = file.name
     
     # --- 1. Upload file to Supabase Storage ---
-    # Path ที่จะเก็บใน Bucket: upload_date/file_id_originalfilename
     stored_path_in_bucket = f"{upload_date}/{file_id}_{orig_filename}"
     
     try:
-        # file.getbuffer() ให้ bytes สำหรับ upload
         supabase.storage.from_(bucket_name).upload(
             file=file.getbuffer(), 
             path=stored_path_in_bucket, 
             file_options={"content-type": "application/zip"}
         )
     except Exception as e:
-        # กรณีไฟล์มีอยู่แล้ว หรือ error อื่น ๆ
         if "The resource already exists" not in str(e):
              st.error(f"Error uploading file to storage: {e}")
         return
 
     # --- 2. Save metadata to PostgreSQL Table ---
-    # 💡 stored_path เก็บ path ใน Storage Bucket
     data_to_insert = {
         "upload_date": upload_date,
         "orig_filename": orig_filename,
@@ -97,7 +94,7 @@ def save_file(upload_date: str, file):
 
 def list_files_by_date(upload_date: str):
     """ดึงรายการไฟล์จาก Supabase DB ตามวันที่"""
-    table_name = st.session_state.SB_TABLE
+    table_name = SB_TABLE
     try:
         response = (
             supabase.table(table_name)
@@ -106,7 +103,6 @@ def list_files_by_date(upload_date: str):
             .order("created_at", desc=True) # เรียงจากใหม่ไปเก่า
             .execute()
         )
-        # แปลง list of dicts เป็น list of tuples (id, filename, stored_path)
         rows = [(d['id'], d['orig_filename'], d['stored_path']) for d in response.data]
         return rows
     except Exception as e:
@@ -115,8 +111,9 @@ def list_files_by_date(upload_date: str):
 
 def delete_file(file_id: int):
     """ลบไฟล์จาก Storage และ Metadata จาก DB"""
-    table_name = st.session_state.SB_TABLE
-    bucket_name = st.session_state.SB_BUCKET
+    # 💡 ใช้ตัวแปร Global
+    table_name = SB_TABLE
+    bucket_name = SB_BUCKET
 
     # --- 1. Find stored_path first ---
     try:
@@ -133,7 +130,6 @@ def delete_file(file_id: int):
         try:
             supabase.storage.from_(bucket_name).remove([stored_path_in_bucket])
         except postgrest.exceptions.APIError as e:
-            # มักจะเกิดถ้าไฟล์ไม่มีอยู่แล้ว
             st.warning(f"File not found or error removing from storage: {e}")
         except Exception as e:
             st.warning(f"Unexpected error removing from storage: {e}")
@@ -146,19 +142,16 @@ def delete_file(file_id: int):
             
 def list_dates_with_files():
     """ดึงวันที่ที่มีไฟล์และจำนวนไฟล์สำหรับ Calendar"""
-    table_name = st.session_state.SB_TABLE
+    table_name = SB_TABLE
     try:
-        # ดึงทุกวันที่ที่มีไฟล์
         response = supabase.table(table_name).select("upload_date").execute()
         df = pd.DataFrame(response.data)
         
         if df.empty:
             return []
 
-        # นับจำนวนไฟล์ต่อวัน
         date_counts = df.groupby("upload_date").size().reset_index(name='count')
         
-        # แปลงเป็น format เดิม [(date, count)]
         rows = list(date_counts.itertuples(index=False, name=None))
         return rows
     except Exception as e:
@@ -170,7 +163,7 @@ def clear_all_uploaded_data():
     st.session_state.clear()
 
 
-# ====== ZIP PARSER (โค้ดส่วนนี้ยังคงเดิม) ======
+# ====== ZIP PARSER ======
 KW = {
     "cpu": ("cpu",),
     "fan": ("fan",),
@@ -199,17 +192,14 @@ def _kind(name):
     n = name.lower()
     hits = [k for k, kws in KW.items() if any(s in n for s in kws)]
 
-    # ---- Priority ----
     if "wason" in hits:
         return "wason"
     if "preset" in hits:
         return "preset"
 
-    # ---- เช็คว่า line ต้องเป็น Excel เท่านั้น ----
     if "line" in hits and (n.endswith(".xlsx") or n.endswith(".xls") or n.endswith(".xlsm")):
         return "line"
 
-    # ---- อื่น ๆ ตามปกติ ----
     for k in ("fan","cpu","msu","client","osc","fm","atten"):
         if k in hits:
             return k
@@ -239,17 +229,14 @@ def find_in_zip(zip_file):
             try:
                 with zf.open(name) as f:
                     df = LOADERS[ext](f)
-                    # print("DEBUG LOADED:", kind, type(df), name)
 
-                # ถ้าเป็น log (.txt) → เก็บเป็น string ใน key "wason_log"
                 if kind == "wason":
-                    found[kind] = (df, name)   # df = string
+                    found[kind] = (df, name)
                 else:
-                    found[kind] = (df, name)   # df = DataFrame
+                    found[kind] = (df, name)
 
             except:
                 continue
-    # 💡 zip_file ที่ส่งมาคือ BytesIO object ที่โหลดมาจาก Supabase Storage
     walk(zipfile.ZipFile(zip_file))
     return found
 
@@ -259,7 +246,7 @@ def safe_copy(obj):
         return obj.copy()
     return obj
 
-# ====== SIDEBAR (โค้ดส่วนนี้ยังคงเดิม) ======
+# ====== SIDEBAR ======
 menu = st.sidebar.radio("เลือกกิจกรรม", [
     "หน้าแรก","Visualization","CPU","FAN","MSU","Line board","Client board",
     "Fiber Flapping","Loss between Core","Loss between EOL","Preset status","APO Remnant","Summary table & report"
@@ -270,7 +257,8 @@ menu = st.sidebar.radio("เลือกกิจกรรม", [
 if menu == "หน้าแรก":
     st.subheader("DWDM Monitoring Dashboard")
     st.markdown("#### Upload & Manage ZIP Files (with Calendar)")
-    st.caption(f"Database: Supabase ({st.session_state.SB_TABLE}) | Storage: Supabase Storage ({st.session_state.SB_BUCKET})") # 💡 เพิ่ม Caption บอกสถานะ
+    # 💡 แก้ไข: ใช้ตัวแปร Global SB_TABLE และ SB_BUCKET
+    st.caption(f"Database: Supabase ({SB_TABLE}) | Storage: Supabase Storage ({SB_BUCKET})") 
 
     chosen_date = st.date_input("Select date", value=date.today())
     files = st.file_uploader(
@@ -284,11 +272,10 @@ if menu == "หน้าแรก":
             for file in files:
                 save_file(str(chosen_date), file)
             st.success("Upload completed to Supabase Storage and Database")
-            st.rerun() # 💡 Rerun เพื่อให้รายการไฟล์อัปเดต
+            st.rerun()
 
     st.subheader("Calendar")
     events = []
-    # 💡 ใช้ list_dates_with_files() ใหม่
     for d, cnt in list_dates_with_files():
         events.append({
             "title": f"{cnt} file(s)",
@@ -323,7 +310,6 @@ if menu == "หน้าแรก":
     selected_date = st.session_state["selected_date"]
 
     st.subheader(f"Files for {selected_date}")
-    # 💡 ใช้ list_files_by_date() ใหม่
     files_list = list_files_by_date(selected_date)
     if not files_list:
         st.info("No files for this date")
@@ -334,7 +320,6 @@ if menu == "หน้าแรก":
             with col1:
                 checked = st.checkbox(fname, key=f"chk_{fid}")
                 if checked:
-                    # fpath ตอนนี้คือ path ใน Supabase Storage
                     selected_files.append((fid, fname, fpath)) 
             with col2:
                 if st.button("Delete", key=f"del_{fid}"):
@@ -351,17 +336,16 @@ if menu == "หน้าแรก":
                 
                 # 💡 NEW: Logic การโหลดไฟล์จาก Supabase Storage
                 for fid, fname, fpath in selected_files:
-                    # fpath คือ stored_path_in_bucket
                     try:
                         with st.spinner(f"Downloading {fname} from Supabase..."):
                             # 💡 ใช้ download() เพื่อดึงไฟล์ ZIP เป็น bytes
                             zip_bytes_data = (
                                 supabase.storage
-                                .from_(st.session_state.SB_BUCKET)
-                                .download(fpath)
+                                # 💡 ใช้ตัวแปร Global SB_BUCKET
+                                .from_(SB_BUCKET)
+                                .download(fpath) 
                             )
                         
-                        # สร้าง BytesIO object เพื่อให้ find_in_zip() ใช้งานได้
                         zip_bytes = io.BytesIO(zip_bytes_data) 
                         
                         res = find_in_zip(zip_bytes)
@@ -372,10 +356,10 @@ if menu == "หน้าแรก":
                                 continue
                             df, zname = pack
                             if kind == "wason":
-                                st.session_state["wason_log"] = df     # ✅ string log
+                                st.session_state["wason_log"] = df
                                 st.session_state["wason_file"] = zname
                             else:
-                                st.session_state[f"{kind}_data"] = df # ✅ DataFrame
+                                st.session_state[f"{kind}_data"] = df
                                 st.session_state[f"{kind}_file"] = zname
                         
                         total += 1
@@ -388,10 +372,9 @@ if menu == "หน้าแรก":
                 st.success("✅ Analysis finished and data loaded into memory.")
 
 
-# ====== Analysis Pages (โค้ดส่วนนี้ยังคงเดิม) ======
+# ====== Analysis Pages (ใช้โค้ดเดิม) ======
 
 elif menu == "CPU":
-# ... โค้ดส่วน CPU เหมือนเดิม
     if st.session_state.get("cpu_data") is not None:
         try:
             df_ref = pd.read_excel("data/CPU.xlsx")
@@ -409,14 +392,13 @@ elif menu == "CPU":
 
 
 elif menu == "FAN":
-# ... โค้ดส่วน FAN เหมือนเดิม
     if st.session_state.get("fan_data") is not None:
         try:
             df_ref = pd.read_excel("data/FAN.xlsx")
             analyzer = FAN_Analyzer(
                 df_fan=safe_copy(st.session_state.get("fan_data")),
                 df_ref=df_ref.copy(),
-                ns="fan"  # namespace สำหรับ cascading_filter
+                ns="fan"
             )
             analyzer.process()
             st.session_state["fan_analyzer"] = analyzer
@@ -429,7 +411,6 @@ elif menu == "FAN":
 
 
 elif menu == "MSU":
-# ... โค้ดส่วน MSU เหมือนเดิม
     if st.session_state.get("msu_data") is not None:
         try:
             df_ref = pd.read_excel("data/MSU.xlsx")
@@ -447,13 +428,11 @@ elif menu == "MSU":
 
 
 elif menu == "Line board":
-# ... โค้ดส่วน Line board เหมือนเดิม
     st.markdown("### Line Cards Performance")
 
-    df_line = st.session_state.get("line_data")      # ✅ DataFrame
-    log_txt = st.session_state.get("wason_log")      # ✅ String
+    df_line = st.session_state.get("line_data")
+    log_txt = st.session_state.get("wason_log")
 
-    # gen pmap จาก TXT ถ้ามี
     if log_txt:
         st.session_state["lb_pmap"] = Line_Analyzer.get_preset_map(log_txt)
     pmap = st.session_state.get("lb_pmap", {})
@@ -462,7 +441,7 @@ elif menu == "Line board":
         try:
             df_ref = pd.read_excel("data/Line.xlsx")
             analyzer = Line_Analyzer(
-                df_line=df_line.copy(),   # ✅ ต้องเป็น DataFrame
+                df_line=df_line.copy(),
                 df_ref=df_ref.copy(),
                 pmap=pmap,
                 ns="line",
@@ -480,17 +459,14 @@ elif menu == "Line board":
 
 
 elif menu == "Client board":
-# ... โค้ดส่วน Client board เหมือนเดิม
     st.markdown("### Client Board")
     if st.session_state.get("client_data") is not None:
         try:
-            # โหลด Reference
             df_ref = pd.read_excel("data/Client.xlsx")
             
-            # สร้าง Analyzer
             analyzer = Client_Analyzer(
                 df_client=st.session_state.client_data.copy(),
-                ref_path="data/Client.xlsx"   # ✅ ให้ class โหลดเอง
+                ref_path="data/Client.xlsx"
             )
             analyzer.process()
             st.session_state["client_analyzer"] = analyzer
@@ -502,18 +478,17 @@ elif menu == "Client board":
 
 
 elif menu == "Fiber Flapping":
-# ... โค้ดส่วน Fiber Flapping เหมือนเดิม
     st.markdown("### Fiber Flapping (OSC + FM)")
 
-    df_osc = st.session_state.get("osc_data")  # จาก ZIP: .xlsx → DataFrame
-    df_fm  = st.session_state.get("fm_data")   # จาก ZIP: .xlsx → DataFrame
+    df_osc = st.session_state.get("osc_data")
+    df_fm  = st.session_state.get("fm_data")
 
     if (df_osc is not None) and (df_fm is not None):
         try:
             analyzer = FiberflappingAnalyzer(
                 df_optical=df_osc.copy(),
                 df_fm=df_fm.copy(),
-                threshold=2.0,   # คงเดิม
+                threshold=2.0,
             )
             analyzer.process()
             st.caption(
@@ -528,9 +503,8 @@ elif menu == "Fiber Flapping":
 
 
 elif menu == "Loss between EOL":
-# ... โค้ดส่วน Loss between EOL เหมือนเดิม
     st.markdown("### Loss between EOL")
-    df_raw = st.session_state.get("atten_data")   # ใช้ atten_data ที่โหลดมา
+    df_raw = st.session_state.get("atten_data")
     if df_raw is not None:
         try:
             analyzer = EOLAnalyzer(
@@ -538,7 +512,7 @@ elif menu == "Loss between EOL":
                 df_raw_data=df_raw.copy(),
                 ref_path="data/EOL.xlsx",
             )
-            analyzer.process()   # ⬅ ตรงนี้ทำให้โชว์ทันที
+            analyzer.process()
             st.session_state["eol_analyzer"] = analyzer
             st.caption(f"Using RAW file: {st.session_state.get('atten_file')}")
         except Exception as e:
@@ -548,9 +522,8 @@ elif menu == "Loss between EOL":
 
 
 elif menu == "Loss between Core":
-# ... โค้ดส่วน Loss between Core เหมือนเดิม
     st.markdown("### Loss between Core")
-    df_raw = st.session_state.get("atten_data")   # ใช้ atten_data เหมือนกัน
+    df_raw = st.session_state.get("atten_data")
     if df_raw is not None:
         try:
             analyzer = CoreAnalyzer(
@@ -558,7 +531,7 @@ elif menu == "Loss between Core":
                 df_raw_data=df_raw.copy(),
                 ref_path="data/EOL.xlsx",
             )
-            analyzer.process()   # ⬅ ตรงนี้ทำให้โชว์ทันที
+            analyzer.process()
             st.session_state["core_analyzer"] = analyzer
             st.caption(f"Using RAW file: {st.session_state.get('atten_file')}")
         except Exception as e:
@@ -568,6 +541,5 @@ elif menu == "Loss between Core":
 
 
 elif menu == "Summary table & report":
-# ... โค้ดส่วน Summary table & report เหมือนเดิม
     summary = SummaryTableReport()
     summary.render()
