@@ -91,12 +91,17 @@ def delete_file(file_id: str):
 
 def list_dates_with_files():
     res = supabase.table("uploads").select("upload_date").order("upload_date", desc=True).execute()
+    print("DEBUG list_dates_with_files res:", res.data)  # ✅ อยู่ในบล็อกเดียวกับ def
+
     if not res.data:
         return []
+
+    # รวมกลุ่ม (group by) แล้วนับเองด้วย pandas
     df = pd.DataFrame(res.data)
     grouped = df.groupby("upload_date").size().reset_index(name="count")
-    return [(row["upload_date"], int(row["count"])) for _, row in grouped.iterrows()]
- print("DEBUG list_dates_with_files res:", res.data)
+    rows = [(row["upload_date"], int(row["count"])) for _, row in grouped.iterrows()]
+    return rows
+
 # ==========================================================
 # ====== CLEAR SESSION ======
 # ==========================================================
