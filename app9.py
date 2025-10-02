@@ -140,10 +140,10 @@ KW = {
     "fan": ("fan",),
     "msu": ("msu",),
     "client": ("client", "client board"),
-    "line":  ("line","line board"),       
+    "line": ("line","line board"),
     "wason": ("wason","log"), 
-    "osc": ("osc","osc optical"),      
-    "fm":  ("fm","alarm","fault management"),
+    "osc": ("osc","osc optical"),
+    "fm": ("fm","alarm","fault management"),
     "atten": ("optical attenuation report", "optical_attenuation_report"),
     "atten": ("optical attenuation report","optical attenuation"),
     "preset": ("mobaxterm", "moba xterm", "moba"),
@@ -152,7 +152,7 @@ KW = {
 LOADERS = {
     ".xlsx": pd.read_excel,
     ".xls": pd.read_excel,
-    ".txt":  lambda f: f.read().decode("utf-8", errors="ignore"),
+    ".txt": lambda f: f.read().decode("utf-8", errors="ignore"),
 }
 
 def _ext(name: str) -> str:
@@ -207,9 +207,9 @@ def find_in_zip(zip_file):
 
                 # ถ้าเป็น log (.txt) → เก็บเป็น string ใน key "wason_log"
                 if kind == "wason":
-                    found[kind] = (df, name)   # df = string
+                    found[kind] = (df, name) # df = string
                 else:
-                    found[kind] = (df, name)   # df = DataFrame
+                    found[kind] = (df, name) # df = DataFrame
 
             except:
                 continue
@@ -319,7 +319,7 @@ if menu == "หน้าแรก":
                             continue
                         df, zname = pack
                         if kind == "wason":
-                            st.session_state["wason_log"] = df    # ✅ string log
+                            st.session_state["wason_log"] = df # ✅ string log
                             st.session_state["wason_file"] = zname
                         else:
                             st.session_state[f"{kind}_data"] = df # ✅ DataFrame
@@ -358,7 +358,7 @@ elif menu == "FAN":
             analyzer = FAN_Analyzer(
                 df_fan=safe_copy(st.session_state.get("fan_data")),
                 df_ref=df_ref.copy(),
-                ns="fan"  # namespace สำหรับ cascading_filter
+                ns="fan" # namespace สำหรับ cascading_filter
             )
             analyzer.process()
             st.session_state["fan_analyzer"] = analyzer
@@ -390,8 +390,8 @@ elif menu == "MSU":
 elif menu == "Line board":
     st.markdown("### Line Cards Performance")
 
-    df_line = st.session_state.get("line_data")      # ✅ DataFrame
-    log_txt = st.session_state.get("wason_log")     # ✅ String
+    df_line = st.session_state.get("line_data") # ✅ DataFrame
+    log_txt = st.session_state.get("wason_log") # ✅ String
 
     # gen pmap จาก TXT ถ้ามี
     if log_txt:
@@ -402,14 +402,14 @@ elif menu == "Line board":
         try:
             df_ref = pd.read_excel("data/Line.xlsx")
             analyzer = Line_Analyzer(
-                df_line=df_line.copy(),   # ✅ ต้องเป็น DataFrame
+                df_line=df_line.copy(), # ✅ ต้องเป็น DataFrame
                 df_ref=df_ref.copy(),
                 pmap=pmap,
                 ns="line",
             )
             analyzer.process()
             st.caption(
-                f"Using LINE file: {st.session_state.get('line_file')}  "
+                f"Using LINE file: {st.session_state.get('line_file')}"
                 f"{'(with WASON log)' if log_txt else '(no WASON log)'}"
             )
         except Exception as e:
@@ -429,7 +429,7 @@ elif menu == "Client board":
             # สร้าง Analyzer
             analyzer = Client_Analyzer(
                 df_client=st.session_state.client_data.copy(),
-                ref_path="data/Client.xlsx"   # ✅ ให้ class โหลดเอง
+                ref_path="data/Client.xlsx" # ✅ ให้ class โหลดเอง
             )
             analyzer.process()
             st.session_state["client_analyzer"] = analyzer
@@ -443,15 +443,15 @@ elif menu == "Client board":
 elif menu == "Fiber Flapping":
     st.markdown("### Fiber Flapping (OSC + FM)")
 
-    df_osc = st.session_state.get("osc_data")   # จาก ZIP: .xlsx → DataFrame
-    df_fm  = st.session_state.get("fm_data")    # จาก ZIP: .xlsx → DataFrame
+    df_osc = st.session_state.get("osc_data") # จาก ZIP: .xlsx → DataFrame
+    df_fm = st.session_state.get("fm_data") # จาก ZIP: .xlsx → DataFrame
 
     if (df_osc is not None) and (df_fm is not None):
         try:
             analyzer = FiberflappingAnalyzer(
                 df_optical=df_osc.copy(),
                 df_fm=df_fm.copy(),
-                threshold=2.0,   # คงเดิม
+                threshold=2.0, # คงเดิม
             )
             analyzer.process()
             st.caption(
@@ -467,7 +467,7 @@ elif menu == "Fiber Flapping":
 
 elif menu == "Loss between EOL":
     st.markdown("### Loss between EOL")
-    df_raw = st.session_state.get("atten_data")   # ใช้ atten_data ที่โหลดมา
+    df_raw = st.session_state.get("atten_data") # ใช้ atten_data ที่โหลดมา
     if df_raw is not None:
         try:
             analyzer = EOLAnalyzer(
@@ -475,7 +475,7 @@ elif menu == "Loss between EOL":
                 df_raw_data=df_raw.copy(),
                 ref_path="data/EOL.xlsx",
             )
-            analyzer.process()   # ⬅ ตรงนี้ทำให้โชว์ทันที
+            analyzer.process() # ⬅ ตรงนี้ทำให้โชว์ทันที
             st.session_state["eol_analyzer"] = analyzer
             st.caption(f"Using RAW file: {st.session_state.get('atten_file')}")
         except Exception as e:
@@ -486,7 +486,7 @@ elif menu == "Loss between EOL":
 
 elif menu == "Loss between Core":
     st.markdown("### Loss between Core")
-    df_raw = st.session_state.get("atten_data")   # ใช้ atten_data เหมือนกัน
+    df_raw = st.session_state.get("atten_data") # ใช้ atten_data เหมือนกัน
     if df_raw is not None:
         try:
             analyzer = CoreAnalyzer(
@@ -494,7 +494,7 @@ elif menu == "Loss between Core":
                 df_raw_data=df_raw.copy(),
                 ref_path="data/EOL.xlsx",
             )
-            analyzer.process()   # ⬅ ตรงนี้ทำให้โชว์ทันที
+            analyzer.process() # ⬅ ตรงนี้ทำให้โชว์ทันที
             st.session_state["core_analyzer"] = analyzer
             st.caption(f"Using RAW file: {st.session_state.get('atten_file')}")
         except Exception as e:
