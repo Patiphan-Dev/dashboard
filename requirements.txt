@@ -15,14 +15,12 @@ pytz
 # Library สำหรับ Calendar Component
 streamlit-calendar
 
-# Library สำหรับ Plotting (ที่เพิ่มเมื่อคำตอบที่แล้ว)
+# Library สำหรับ Plotting
 plotly 
-
-# ====== NEW ADDITION ======
-# Library ที่ขาดไปสำหรับ report.py (ใช้สร้าง PDF Report)
-reportlab
 
 # NEW: สำหรับการใช้งาน Supabase Storage/Client
 supabase-py
 
-# ==========================
+# ⚠️ OPTIONAL: reportlab มักต้องการ Build Tools 
+# ⚠️ ให้ลองลบออกก่อนเพื่อยืนยันว่าตัวอื่นติดตั้งได้
+reportlab
