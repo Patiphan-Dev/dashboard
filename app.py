@@ -96,7 +96,7 @@ def list_dates_with_files():
     df = pd.DataFrame(res.data)
     grouped = df.groupby("upload_date").size().reset_index(name="count")
     return [(row["upload_date"], int(row["count"])) for _, row in grouped.iterrows()]
-
+ print("DEBUG list_dates_with_files res:", res.data)
 # ==========================================================
 # ====== CLEAR SESSION ======
 # ==========================================================
