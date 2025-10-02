@@ -111,7 +111,6 @@ def list_files_by_date(upload_date: str):
         st.info(f"No files found for {upload_date}")
         return []
     return [(r['id'], r['orig_filename'], r['stored_path']) for r in res.data]
-y
 
 def delete_file(file_id: str): 
     """1. Remove file from Supabase Storage. 2. Delete Metadata from PostgreSQL."""
