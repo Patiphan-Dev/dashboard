@@ -1,127 +1,144 @@
+# app.py
 import os
-import sqlite3
+import io
+import zipfile
 import uuid
 from datetime import datetime, date
 import pytz
+
 import streamlit as st
-from streamlit_calendar import calendar
-import io, zipfile
 import pandas as pd
+from streamlit_calendar import calendar
+from supabase import create_client
 
-# ====== IMPORT ANALYZERS ======
-from CPU_Analyzer import CPU_Analyzer
-from FAN_Analyzer import FAN_Analyzer
-from MSU_Analyzer import MSU_Analyzer
-from Line_Analyzer import Line_Analyzer
-from Client_Analyzer import Client_Analyzer
-from Fiberflapping_Analyzer import FiberflappingAnalyzer
-from EOL_Core_Analyzer import EOLAnalyzer, CoreAnalyzer
+# -------------------
+# CONFIG / SECRETS
+# -------------------
+# On Streamlit Cloud: set these in the Secrets UI (not in git)
+SUPABASE_URL = st.secrets.get("SUPABASE_URL")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY")
+SUPABASE_BUCKET = st.secrets.get("SUPABASE_BUCKET")
 
-from table1 import SummaryTableReport
+if not (SUPABASE_URL and SUPABASE_KEY and SUPABASE_BUCKET):
+    st.error("Please set SUPABASE_URL, SUPABASE_KEY and SUPABASE_BUCKET in Streamlit secrets.")
+    st.stop()
 
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ====== CONFIG ======
-st.set_page_config(layout="wide")
-pd.set_option("styler.render.max_elements", 1_200_000)
-
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-DB_FILE = "files.db"
-
-
-# ====== DB INIT ======
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS uploads (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        upload_date TEXT,
-        orig_filename TEXT,
-        stored_path TEXT,
-        created_at TEXT
-    )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-
-# ====== DB FUNCTIONS ======
-def save_file(upload_date: str, file):
+# -------------------
+# Helpers - Supabase
+# -------------------
+def save_file_to_supabase(upload_date: str, file):
+    """
+    Upload file bytes to Supabase Storage and insert metadata into `uploads` table.
+    """
+    # ensure bucket exists (assume created beforehand)
     file_id = str(uuid.uuid4())
-    stored_name = f"{file_id}_{file.name}"
-    stored_path = os.path.join(UPLOAD_DIR, upload_date, stored_name)
-    os.makedirs(os.path.dirname(stored_path), exist_ok=True)
+    stored_path = f"uploads/{upload_date}/{file_id}_{file.name}"
 
-    with open(stored_path, "wb") as f:
-        f.write(file.getbuffer())
+    # upload (file is UploadedFile from streamlit -> has .getvalue())
+    try:
+        # supabase-py storage API: upload(path, file)
+        resp = supabase.storage.from_(SUPABASE_BUCKET).upload(stored_path, file.getvalue())
+    except Exception as e:
+        st.error(f"Storage upload error: {e}")
+        return False
 
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO uploads (upload_date, orig_filename, stored_path, created_at)
-        VALUES (?, ?, ?, ?)
-    """, (upload_date, file.name, stored_path, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    # insert metadata to 'uploads' table
+    payload = {
+        "id": file_id,
+        "upload_date": upload_date,
+        "orig_filename": file.name,
+        "stored_path": stored_path,
+        "created_at": datetime.now().isoformat()
+    }
+    try:
+        res = supabase.table("uploads").insert(payload).execute()
+        if res.error:
+            st.error(f"DB insert error: {res.error.message if hasattr(res.error,'message') else res.error}")
+            return False
+    except Exception as e:
+        st.error(f"DB insert exception: {e}")
+        return False
+
+    return True
+
 
 def list_files_by_date(upload_date: str):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, orig_filename, stored_path FROM uploads WHERE upload_date=?", (upload_date,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    """
+    Return list of tuples (id, orig_filename, stored_path) for given upload_date
+    """
+    try:
+        res = supabase.table("uploads").select("id, orig_filename, stored_path").eq("upload_date", upload_date).order("created_at", desc=True).execute()
+        rows = res.data or []
+        return [(r["id"], r["orig_filename"], r["stored_path"]) for r in rows]
+    except Exception as e:
+        st.error(f"Error listing files: {e}")
+        return []
 
-def delete_file(file_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT stored_path FROM uploads WHERE id=?", (file_id,))
-    row = c.fetchone()
-    if row:
-        try:
-            os.remove(row[0])  # ลบไฟล์จากดิสก์
-        except FileNotFoundError:
-            pass
-    c.execute("DELETE FROM uploads WHERE id=?", (file_id,))
-    conn.commit()
-    conn.close()
+
+def delete_file(file_id: str):
+    """
+    Delete metadata row and remove file from Storage (best-effort).
+    """
+    try:
+        # get stored_path
+        res = supabase.table("uploads").select("stored_path").eq("id", file_id).limit(1).execute()
+        rows = res.data or []
+        if rows:
+            stored_path = rows[0]["stored_path"]
+            try:
+                supabase.storage.from_(SUPABASE_BUCKET).remove([stored_path])
+            except Exception:
+                # ignore storage errors, continue to delete metadata
+                pass
+
+        # delete metadata
+        supabase.table("uploads").delete().eq("id", file_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Delete error: {e}")
+        return False
+
 
 def list_dates_with_files():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT upload_date, COUNT(*) FROM uploads GROUP BY upload_date")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    """
+    Return list of tuples (upload_date, count)
+    We'll fetch all upload_date rows then group in pandas to be safe.
+    """
+    try:
+        res = supabase.table("uploads").select("upload_date").order("upload_date", desc=True).execute()
+        data = res.data or []
+        if not data:
+            return []
+        df = pd.DataFrame(data)
+        grouped = df.groupby("upload_date").size().reset_index(name="count")
+        rows = [(r["upload_date"], int(r["count"])) for _, r in grouped.iterrows()]
+        return rows
+    except Exception as e:
+        st.error(f"Error listing dates: {e}")
+        return []
 
 
-# ====== CLEAR SESSION ======
-def clear_all_uploaded_data():
-    st.session_state.clear()
-
-
-# ====== ZIP PARSER ======
+# -------------------
+# ZIP PARSER (same logic as before)
+# -------------------
 KW = {
     "cpu": ("cpu",),
     "fan": ("fan",),
     "msu": ("msu",),
     "client": ("client", "client board"),
-    "line":  ("line","line board"),       
-    "wason": ("wason","log"), 
-    "osc": ("osc","osc optical"),      
-    "fm":  ("fm","alarm","fault management"),
+    "line": ("line", "line board"),
+    "wason": ("wason", "log"),
+    "osc": ("osc", "osc optical"),
+    "fm": ("fm", "alarm", "fault management"),
     "atten": ("optical attenuation report", "optical_attenuation_report"),
-    "atten": ("optical attenuation report","optical attenuation"),
-    "preset": ("mobaxterm", "moba xterm", "moba"),
 }
 
 LOADERS = {
     ".xlsx": pd.read_excel,
     ".xls": pd.read_excel,
-    ".txt":  lambda f: f.read().decode("utf-8", errors="ignore"),
+    ".txt": lambda f: f.read().decode("utf-8", errors="ignore"),
 }
 
 def _ext(name: str) -> str:
@@ -131,32 +148,16 @@ def _ext(name: str) -> str:
 def _kind(name):
     n = name.lower()
     hits = [k for k, kws in KW.items() if any(s in n for s in kws)]
-
-    # ---- Priority ----
-    if "wason" in hits:
+    # prioritize wason if txt
+    if "wason" in hits and name.lower().endswith(".txt"):
         return "wason"
-    if "preset" in hits:
-        return "preset"
-
-    # ---- เช็คว่า line ต้องเป็น Excel เท่านั้น ----
-    if "line" in hits and (n.endswith(".xlsx") or n.endswith(".xls") or n.endswith(".xlsm")):
-        return "line"
-
-    # ---- อื่น ๆ ตามปกติ ----
-    for k in ("fan","cpu","msu","client","osc","fm","atten"):
-        if k in hits:
-            return k
-
     return hits[0] if hits else None
 
-
-def find_in_zip(zip_file):
+def find_in_zip(zip_bytes_io):
     found = {k: None for k in KW}
     def walk(zf):
         for name in zf.namelist():
-            if all(found.values()): 
-                return
-            if name.endswith("/"): 
+            if name.endswith("/"):
                 continue
             lname = name.lower()
             if lname.endswith(".zip"):
@@ -167,75 +168,54 @@ def find_in_zip(zip_file):
                 continue
             ext = _ext(lname)
             kind = _kind(lname)
-            if not ext or not kind or found[kind]:
+            if not ext or not kind or found.get(kind):
                 continue
             try:
                 with zf.open(name) as f:
                     df = LOADERS[ext](f)
-                    print("DEBUG LOADED:", kind, type(df), name)
-
-                # ถ้าเป็น log (.txt) → เก็บเป็น string ใน key "wason_log"
                 if kind == "wason":
-                    found[kind] = (df, name)   # df = string
+                    found[kind] = (df, name)
                 else:
-                    found[kind] = (df, name)   # df = DataFrame
-
-            except:
+                    found[kind] = (df, name)
+            except Exception:
                 continue
-    walk(zipfile.ZipFile(zip_file))
+    walk(zipfile.ZipFile(zip_bytes_io))
     return found
 
+# -------------------
+# UI
+# -------------------
+st.set_page_config(layout="wide", page_title="DWDM Monitoring (Supabase)")
+st.title("DWDM Monitoring Dashboard (Supabase Storage)")
 
-def safe_copy(obj):
-    if isinstance(obj, pd.DataFrame):
-        return obj.copy()
-    return obj
+menu = st.sidebar.radio("เมนู", ["หน้าแรก","CPU","FAN","MSU","Line board","Client board","Fiber Flapping","Loss between Core","Loss between EOL","Summary"])
 
-# ====== SIDEBAR ======
-menu = st.sidebar.radio("เลือกกิจกรรม", [
-    "หน้าแรก","Visualization","CPU","FAN","MSU","Line board","Client board",
-    "Fiber Flapping","Loss between Core","Loss between EOL","Preset status","APO Remnant","Summary table & report"
-])
-
-
-# ====== หน้าแรก (Calendar Upload + Run Analysis + Delete) ======
 if menu == "หน้าแรก":
-    st.subheader("DWDM Monitoring Dashboard")
-    st.markdown("#### Upload & Manage ZIP Files (with Calendar)")
-
+    st.subheader("Upload ZIP files to Supabase")
     chosen_date = st.date_input("Select date", value=date.today())
-    files = st.file_uploader(
-        "Upload ZIP files",
-        type=["zip"],
-        accept_multiple_files=True,
-        key=f"uploader_{chosen_date}"
-    )
-    if files:
-        if st.button("Upload", key=f"upload_btn_{chosen_date}"):
-            for file in files:
-                save_file(str(chosen_date), file)
-            st.success("Upload completed")
-            st.rerun()
+    files = st.file_uploader("Upload ZIP files (.zip)", type=["zip"], accept_multiple_files=True)
 
-    st.subheader("Calendar")
+    # keep pending files across reruns
+    if files:
+        st.session_state["pending_files"] = files
+
+    if st.button("Upload") and st.session_state.get("pending_files"):
+        uploaded = st.session_state.get("pending_files")
+        success_count = 0
+        for f in uploaded:
+            ok = save_file_to_supabase(str(chosen_date), f)
+            if ok:
+                success_count += 1
+        st.success(f"Uploaded {success_count}/{len(uploaded)} files")
+        # clear pending
+        st.session_state.pop("pending_files", None)
+        st.experimental_rerun()
+
+    # Calendar: show dates that have files
     events = []
     for d, cnt in list_dates_with_files():
-        events.append({
-            "title": f"{cnt} file(s)",
-            "start": d,
-            "allDay": True,
-            "color": "blue"
-        })
-
-    calendar_res = calendar(
-        events=events,
-        options={
-            "initialView": "dayGridMonth",
-            "height": "400px",
-            "selectable": True,
-        },
-        key="calendar",
-    )
+        events.append({"title": f"{cnt} file(s)", "start": d, "allDay": True, "color": "blue"})
+    calendar_res = calendar(events=events, options={"initialView": "dayGridMonth","height":"400px","selectable":True}, key="calendar")
 
     if "selected_date" not in st.session_state:
         st.session_state["selected_date"] = str(date.today())
@@ -246,230 +226,123 @@ if menu == "หน้าแรก":
         dt_utc = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
         dt_th = dt_utc.astimezone(pytz.timezone("Asia/Bangkok"))
         clicked_date = dt_th.date().isoformat()
-
     if clicked_date:
         st.session_state["selected_date"] = clicked_date
 
     selected_date = st.session_state["selected_date"]
-
     st.subheader(f"Files for {selected_date}")
+
     files_list = list_files_by_date(selected_date)
     if not files_list:
         st.info("No files for this date")
     else:
-        selected_files = []
+        selected = []
         for fid, fname, fpath in files_list:
-            col1, col2 = st.columns([4, 1])
+            col1, col2 = st.columns([4,1])
             with col1:
                 checked = st.checkbox(fname, key=f"chk_{fid}")
                 if checked:
-                    selected_files.append((fid, fname, fpath))
+                    selected.append((fid, fname, fpath))
             with col2:
                 if st.button("Delete", key=f"del_{fid}"):
                     delete_file(fid)
-                    st.rerun()
+                    st.experimental_rerun()
 
-        
-        if st.button("Run Analysis", key="analyze_btn"):
-            if not selected_files:
-                st.warning("Please select at least one file to analyze")
+        if st.button("Run Analysis"):
+            if not selected:
+                st.warning("Select at least one file")
             else:
-                clear_all_uploaded_data()
+                # download and parse
                 total = 0
-                for fid, fname, fpath in selected_files:
-                    with open(fpath, "rb") as f:
-                        zip_bytes = io.BytesIO(f.read())
-                        res = find_in_zip(zip_bytes)
-                    for kind, pack in res.items():
-                        if not pack:
+                for fid, fname, fpath in selected:
+                    with st.spinner(f"Downloading {fname}..."):
+                        try:
+                            # supabase download returns bytes
+                            file_bytes = supabase.storage.from_(SUPABASE_BUCKET).download(fpath)
+                            z = io.BytesIO(file_bytes)
+                            res = find_in_zip(z)
+                        except Exception as e:
+                            st.error(f"Error downloading/processing {fname}: {e}")
                             continue
-                        df, zname = pack
-                        if kind == "wason":
-                            st.session_state["wason_log"] = df    # ✅ string log
-                            st.session_state["wason_file"] = zname
-                        else:
-                            st.session_state[f"{kind}_data"] = df # ✅ DataFrame
+
+                        # push to session_state
+                        for kind, pack in res.items():
+                            if not pack:
+                                continue
+                            df, zname = pack
+                            st.session_state[f"{kind}_data"] = df
                             st.session_state[f"{kind}_file"] = zname
+                        total += 1
+                st.success(f"Analysis finished for {total} file(s)")
 
-                    total += 1
-
-                st.session_state["zip_loaded"] = True
-
-
-                # 🔹 แก้ตรงนี้ให้แสดงว่าเสร็จแล้ว
-                st.success("✅ Analysis finished")
-
-
+# -------------------
+# Analyzer pages (simple rendering of loaded DataFrames)
+# -------------------
 elif menu == "CPU":
-    if st.session_state.get("cpu_data") is not None:
-        try:
-            df_ref = pd.read_excel("data/CPU.xlsx")
-            analyzer = CPU_Analyzer(
-                df_cpu=safe_copy(st.session_state.get("cpu_data")),
-                df_ref=df_ref.copy(),
-                ns="cpu"
-            )
-            analyzer.process()
-            st.session_state["cpu_analyzer"] = analyzer 
-        except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
+    df = st.session_state.get("cpu_data")
+    if df is not None:
+        st.header("CPU Analysis")
+        st.write("Using:", st.session_state.get("cpu_file"))
+        st.dataframe(df.head(50))
     else:
-        st.info("Please upload file to start the analysis")
-
+        st.info("Upload a ZIP containing a CPU file and run analysis first.")
 
 elif menu == "FAN":
-    if st.session_state.get("fan_data") is not None:
-        try:
-            df_ref = pd.read_excel("data/FAN.xlsx")
-            analyzer = FAN_Analyzer(
-                df_fan=safe_copy(st.session_state.get("fan_data")),
-                df_ref=df_ref.copy(),
-                ns="fan"  # namespace สำหรับ cascading_filter
-            )
-            analyzer.process()
-            st.session_state["fan_analyzer"] = analyzer
-            st.write("DEBUG set fan_analyzer", st.session_state["fan_analyzer"])
-
-        except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
+    df = st.session_state.get("fan_data")
+    if df is not None:
+        st.header("FAN Analysis")
+        st.dataframe(df.head(50))
     else:
-        st.info("Please upload a FAN file to start the analysis")
-
+        st.info("Upload a ZIP containing a FAN file and run analysis first.")
 
 elif menu == "MSU":
-    if st.session_state.get("msu_data") is not None:
-        try:
-            df_ref = pd.read_excel("data/MSU.xlsx")
-            analyzer = MSU_Analyzer(
-                df_msu=safe_copy(st.session_state.get("msu_data")),
-                df_ref=df_ref.copy(),
-                ns="msu"
-            )
-            analyzer.process()
-            st.session_state["msu_analyzer"] = analyzer
-        except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
+    df = st.session_state.get("msu_data")
+    if df is not None:
+        st.header("MSU Analysis")
+        st.dataframe(df.head(50))
     else:
-        st.info("Please upload an MSU file to start the analysis")
-
+        st.info("Upload a ZIP containing MSU and run analysis first.")
 
 elif menu == "Line board":
-    st.markdown("### Line Cards Performance")
-
-    df_line = st.session_state.get("line_data")      # ✅ DataFrame
-    log_txt = st.session_state.get("wason_log")     # ✅ String
-
-    # gen pmap จาก TXT ถ้ามี
-    if log_txt:
-        st.session_state["lb_pmap"] = Line_Analyzer.get_preset_map(log_txt)
-    pmap = st.session_state.get("lb_pmap", {})
-
-    if df_line is not None:
-        try:
-            df_ref = pd.read_excel("data/Line.xlsx")
-            analyzer = Line_Analyzer(
-                df_line=df_line.copy(),   # ✅ ต้องเป็น DataFrame
-                df_ref=df_ref.copy(),
-                pmap=pmap,
-                ns="line",
-            )
-            analyzer.process()
-            st.caption(
-                f"Using LINE file: {st.session_state.get('line_file')}  "
-                f"{'(with WASON log)' if log_txt else '(no WASON log)'}"
-            )
-        except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
+    df = st.session_state.get("line_data")
+    if df is not None:
+        st.header("Line board")
+        st.dataframe(df.head(50))
     else:
-        st.info("Please upload a ZIP on 'หน้าแรก' that contains a Line workbook")
-
-
+        st.info("Upload ZIP with Line sheet and run analysis first.")
 
 elif menu == "Client board":
-    st.markdown("### Client Board")
-    if st.session_state.get("client_data") is not None:
-        try:
-            # โหลด Reference
-            df_ref = pd.read_excel("data/Client.xlsx")
-            
-            # สร้าง Analyzer
-            analyzer = Client_Analyzer(
-                df_client=st.session_state.client_data.copy(),
-                ref_path="data/Client.xlsx"   # ✅ ให้ class โหลดเอง
-            )
-            analyzer.process()
-            st.session_state["client_analyzer"] = analyzer
-            st.caption(f"Using CLIENT file: {st.session_state.get('client_file')}")
-        except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
+    df = st.session_state.get("client_data")
+    if df is not None:
+        st.header("Client board")
+        st.dataframe(df.head(50))
     else:
-        st.info("Please upload a ZIP on 'หน้าแรก' that contains a Client workbook")
-
+        st.info("Upload ZIP with Client sheet and run analysis first.")
 
 elif menu == "Fiber Flapping":
-    st.markdown("### Fiber Flapping (OSC + FM)")
+    st.info("Fiber Flapping: show OSC & FM if available")
+    osc = st.session_state.get("osc_data")
+    fm = st.session_state.get("fm_data")
+    if osc is not None:
+        st.subheader("OSC")
+        st.dataframe(osc.head(50))
+    if fm is not None:
+        st.subheader("FM")
+        st.dataframe(fm.head(50))
 
-    df_osc = st.session_state.get("osc_data")   # จาก ZIP: .xlsx → DataFrame
-    df_fm  = st.session_state.get("fm_data")    # จาก ZIP: .xlsx → DataFrame
-
-    if (df_osc is not None) and (df_fm is not None):
-        try:
-            analyzer = FiberflappingAnalyzer(
-                df_optical=df_osc.copy(),
-                df_fm=df_fm.copy(),
-                threshold=2.0,   # คงเดิม
-            )
-            analyzer.process()
-            st.caption(
-                f"Using OSC: {st.session_state.get('osc_file')} | "
-                f"FM: {st.session_state.get('fm_file')}"
-            )
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
+elif menu == "Loss between Core" or menu == "Loss between EOL":
+    df = st.session_state.get("atten_data")
+    if df is not None:
+        st.dataframe(df.head(50))
     else:
-        st.info("Please upload a ZIP on 'หน้าแรก' that contains both OSC (optical) and FM workbooks.")
+        st.info("Upload ZIP with attenuation report and run analysis first.")
 
+elif menu == "Summary":
+    st.header("Summary (mock)")
+    st.write("You can implement summary aggregation here (e.g. read analyzers from session state)")
 
-
-elif menu == "Loss between EOL":
-    st.markdown("### Loss between EOL")
-    df_raw = st.session_state.get("atten_data")   # ใช้ atten_data ที่โหลดมา
-    if df_raw is not None:
-        try:
-            analyzer = EOLAnalyzer(
-                df_ref=None,
-                df_raw_data=df_raw.copy(),
-                ref_path="data/EOL.xlsx",
-            )
-            analyzer.process()   # ⬅ ตรงนี้ทำให้โชว์ทันที
-            st.session_state["eol_analyzer"] = analyzer
-            st.caption(f"Using RAW file: {st.session_state.get('atten_file')}")
-        except Exception as e:
-            st.error(f"An error occurred during EOL analysis: {e}")
-    else:
-        st.info("Please upload a ZIP file that contains the attenuation report.")
-
-
-elif menu == "Loss between Core":
-    st.markdown("### Loss between Core")
-    df_raw = st.session_state.get("atten_data")   # ใช้ atten_data เหมือนกัน
-    if df_raw is not None:
-        try:
-            analyzer = CoreAnalyzer(
-                df_ref=None,
-                df_raw_data=df_raw.copy(),
-                ref_path="data/EOL.xlsx",
-            )
-            analyzer.process()   # ⬅ ตรงนี้ทำให้โชว์ทันที
-            st.session_state["core_analyzer"] = analyzer
-            st.caption(f"Using RAW file: {st.session_state.get('atten_file')}")
-        except Exception as e:
-            st.error(f"An error occurred during Core analysis: {e}")
-    else:
-        st.info("Please upload a ZIP file that contains the attenuation report.")
-
-
-
-elif menu == "Summary table & report":
-    summary = SummaryTableReport()
-    summary.render()
+# Debug helper
+if st.sidebar.checkbox("🔍 Debug"):
+    st.sidebar.write("Pending files:", "Yes" if st.session_state.get("pending_files") else "No")
+    st.sidebar.write("Selected date:", st.session_state.get("selected_date"))
+    st.sidebar.write("Dates with files:", list_dates_with_files())
