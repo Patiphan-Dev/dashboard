@@ -2,19 +2,22 @@
 streamlit
 pandas
 
-# Library สำหรับการอ่านไฟล์ Excel (ที่คุณใช้ใน CPU, FAN, MSU, Line, Client, EOL/Core)
+# Library สำหรับการอ่านไฟล์ Excel
 openpyxl
 
-# Library สำหรับการเชื่อมต่อ Supabase (PostgreSQL) ผ่าน st.connection(type="sql")
+# Library สำหรับการเชื่อมต่อ Supabase (PostgreSQL)
 sqlalchemy
 psycopg2-binary
 
-# Library สำหรับการจัดการ Timezone (ที่คุณใช้ในโค้ด)
+# Library สำหรับการจัดการ Timezone
 pytz
 
-# Library สำหรับ Calendar Component (ที่คุณใช้)
+# Library สำหรับ Calendar Component
 streamlit-calendar
 
-# หากมี Library อื่น ๆ ที่ใช้ในไฟล์ CPU_Analyzer, FAN_Analyzer, 
-# MSU_Analyzer, Line_Analyzer, Client_Analyzer, Fiberflapping_Analyzer,
-# EOL_Core_Analyzer, และ table1 ให้เพิ่มลงไปตรงนี้ด้วย
+# ====== NEW ADDITION ======
+# Library ที่ขาดไปสำหรับ Line_Analyzer.py
+plotly 
+# ==========================
+
+# หากมี Library อื่น ๆ ที่ใช้ในไฟล์ Analyzer อื่น ๆ ให้เพิ่มลงไปตรงนี้ด้วย
