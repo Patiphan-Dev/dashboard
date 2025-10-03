@@ -33,6 +33,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ====== DB INIT / CONNECTION & SUPABASE CLIENT INIT ======
 
 # 1. SQL Connection (สำหรับ PostgreSQL Metadata Table)
+# ใช้ st.connection เพื่อจัดการการเชื่อมต่อกับ Supabase PostgreSQL
 try:
     conn = st.connection("supabase", type="sql")
 except Exception as e:
@@ -119,6 +120,7 @@ def list_files_by_date(upload_date: str):
         params={"upload_date": upload_date},
         ttl="1h"
     )
+    # คืนค่าเป็น Tuple list เพื่อให้เข้ากับ Logic เดิม
     return list(df[['id', 'orig_filename', 'stored_path']].itertuples(index=False, name=None))
 
 
@@ -153,7 +155,6 @@ def delete_file(file_id: int):
     # 2. ลบไฟล์จาก Supabase Storage (Remove)
     try:
         # 🆕 DELETE request ไปยัง Supabase Storage API
-        # Supabase API สำหรับลบต้องการ Body เป็น JSON array ของ path
         response = requests.delete(
             STORAGE_API_URL, 
             headers={"Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
@@ -180,11 +181,12 @@ def list_dates_with_files():
         "SELECT upload_date, COUNT(id) as count FROM uploads GROUP BY upload_date",
         ttl="1h"
     )
+    # คืนค่าเป็น Tuple list เพื่อให้เข้ากับ Logic เดิม
     return list(df.itertuples(index=False, name=None))
 # -----------------------------------------------------------
 
 
-# ====== CLEAR SESSION & ZIP PARSER (คงเดิม) ======
+# ====== CLEAR SESSION & ZIP PARSER (ส่วนนี้คงเดิม) ======
 def clear_all_uploaded_data():
     # ล้างสถานะการวิเคราะห์ทั้งหมด
     keys_to_clear = [k for k in st.session_state.keys() if k.endswith(("_data", "_file", "wason_log", "analyzer", "lb_pmap", "zip_loaded"))]
@@ -282,7 +284,7 @@ if menu == "หน้าแรก":
                 st.error("Cannot upload. Supabase Storage client is not initialized.")
             else:
                 for file in files:
-                    save_file_to_storage(str(chosen_date), file)
+                    save_file_to_storage(str(chosen_date), file) # ⬅️ ใช้ save_file_to_storage ใหม่
                 st.success(f"Upload completed ({len(files)} file(s))")
                 st.rerun()
 
