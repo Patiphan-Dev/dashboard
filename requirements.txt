@@ -1,3 +1,5 @@
+# requirements.txt
+
 # Core Libraries for Streamlit and Data
 streamlit
 pandas
@@ -7,7 +9,7 @@ openpyxl
 
 # Library สำหรับการเชื่อมต่อ Supabase (PostgreSQL)
 sqlalchemy
-psycopg2-binary
+psycopg2-binary  # ⬅️ ลองใช้ตัวนี้ต่อไป (อาจจะผ่านเมื่อ supabase-py ถูกลบ)
 
 # Library สำหรับการจัดการ Timezone
 pytz
@@ -18,8 +20,11 @@ streamlit-calendar
 # Library สำหรับ Plotting
 plotly 
 
+# 🆕 NEW: สำหรับการติดต่อ Supabase Storage API โดยตรง
+requests
+
 # NEW: สำหรับการใช้งาน Supabase Storage/Client
-supabase-py
+# supabase-py
 
 # ⚠️ OPTIONAL: reportlab มักต้องการ Build Tools 
 # ⚠️ ให้ลองลบออกก่อนเพื่อยืนยันว่าตัวอื่นติดตั้งได้

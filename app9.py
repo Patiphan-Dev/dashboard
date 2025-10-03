@@ -7,7 +7,7 @@ from streamlit_calendar import calendar
 import io, zipfile
 import pandas as pd
 from sqlalchemy import text # ใช้สำหรับ DML ใน PostgreSQL
-from supabase import create_client, Client # 🆕 Import Supabase Client สำหรับ Storage
+import requests # 🆕 Import requests แทน supabase-py
 
 # ====== IMPORT ANALYZERS ======
 from CPU_Analyzer import CPU_Analyzer
@@ -39,58 +39,59 @@ except Exception as e:
     st.error(f"Failed to connect to Supabase SQL. Error: {e}")
     conn = None 
 
-# 2. Supabase Client (สำหรับ Storage)
-# 🆕 ดึงค่าจาก Streamlit Secrets
+# 2. Supabase Client (สำหรับ Storage - ใช้ Requests แทน)
 try:
-    SUPABASE_URL = st.secrets.supabase_client.url
+    # 🆕 ดึงค่าจาก Streamlit Secrets และเตรียม URL/Headers
+    SUPABASE_URL = st.secrets.supabase_client.url.rstrip('/')
     SUPABASE_KEY = st.secrets.supabase_client.anon_key
     BUCKET_NAME = st.secrets.supabase_client.bucket_name
+    
+    # สร้าง BASE URL สำหรับเรียก API (storage.v1.object)
+    STORAGE_API_URL = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_NAME}" 
+
+    # สร้าง Headers สำหรับการส่ง requests
+    HEADERS = {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "x-upsert": "true" # อนุญาตให้อัปโหลดทับได้
+    }
+
 except AttributeError:
-    st.error("Please configure [supabase_client] secrets (url, anon_key, bucket_name).")
-    SUPABASE_URL, SUPABASE_KEY, BUCKET_NAME = None, None, None
+    st.error("Please configure [supabase_client] secrets correctly.")
+    SUPABASE_KEY, BUCKET_NAME, STORAGE_API_URL, HEADERS = None, None, None, None
 
-
-@st.cache_resource
-def init_supabase_storage_client() -> Client:
-    """สร้าง Supabase Client สำหรับ Storage API"""
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            return create_client(SUPABASE_URL, SUPABASE_KEY)
-        except Exception as e:
-            st.error(f"Failed to initialize Supabase Storage Client: {e}")
-            return None
-    return None
-
-supabase_client = init_supabase_storage_client()
 # -----------------------------------------------------------
 
 
-# ====== DB/STORAGE FUNCTIONS (Cloud Persistence) ======
+# ====== DB/STORAGE FUNCTIONS (Cloud Persistence - ใช้ Requests) ======
 
 def save_file_to_storage(upload_date: str, file):
-    """บันทึกไฟล์ลง Supabase Storage และ Metadata ลง PostgreSQL"""
-    if conn is None or supabase_client is None:
+    """บันทึกไฟล์ลง Supabase Storage และ Metadata ลง PostgreSQL ด้วย Requests"""
+    if conn is None or STORAGE_API_URL is None:
         st.warning("Cannot save file: Supabase connection or client is not available.")
         return
 
-    # 1. บันทึกไฟล์ลง Supabase Storage
+    # 1. บันทึกไฟล์ลง Supabase Storage (Upload)
     file_id = str(uuid.uuid4())
     stored_name = f"{file_id}_{file.name}"
-    # Path ใน Storage: analysis_zips/YYYY-MM-DD/uuid_filename
     storage_path = f"{upload_date}/{stored_name}"
 
+    upload_headers = HEADERS.copy()
+    upload_headers["Content-Type"] = "application/zip" # กำหนด Content-Type เฉพาะ Upload
+
     try:
-        # Upload file bytes to Storage
-        supabase_client.storage.from_(BUCKET_NAME).upload(
-            file=file.getbuffer(), 
-            path=storage_path, 
-            file_options={"content-type": "application/zip"} # กำหนด MIME Type
+        # 🆕 POST request ไปยัง Supabase Storage API
+        response = requests.post(
+            f"{STORAGE_API_URL}/{storage_path}", 
+            headers=upload_headers,
+            data=file.getbuffer()
         )
-    except Exception as e:
+        response.raise_for_status() # ตรวจสอบ HTTP Errors
+        
+    except requests.exceptions.RequestException as e:
         st.error(f"Error uploading file '{file.name}' to Supabase Storage: {e}")
         return
 
-    # 2. บันทึก Metadata ลง PostgreSQL
+    # 2. บันทึก Metadata ลง PostgreSQL 
     current_time_str = datetime.now(pytz.timezone("Asia/Bangkok")).isoformat()
     with conn.session as session:
         session.execute(
@@ -103,7 +104,7 @@ def save_file_to_storage(upload_date: str, file):
             params={
                 "upload_date": upload_date, 
                 "orig_filename": file.name, 
-                "stored_path": storage_path, # ⬅️ ใช้ Storage Path
+                "stored_path": storage_path, 
                 "created_at": current_time_str
             }
         )
@@ -118,27 +119,30 @@ def list_files_by_date(upload_date: str):
         params={"upload_date": upload_date},
         ttl="1h"
     )
-    # คืนค่าเป็น list of tuples (id, orig_filename, stored_path)
     return list(df[['id', 'orig_filename', 'stored_path']].itertuples(index=False, name=None))
 
 
-@st.cache_data(ttl=600) # Cache 10 นาที
+@st.cache_data(ttl=600)
 def get_file_bytes_from_storage(storage_path: str):
-    """ดึงไฟล์ bytes จาก Supabase Storage"""
-    if supabase_client is None:
+    """ดึงไฟล์ bytes จาก Supabase Storage ด้วย Requests"""
+    if STORAGE_API_URL is None:
         return None
     try:
-        # ดาวน์โหลดไฟล์
-        res = supabase_client.storage.from_(BUCKET_NAME).download(storage_path)
-        return io.BytesIO(res)
-    except Exception as e:
-        st.error(f"Error downloading file '{storage_path}' from Storage: {e}")
+        # 🆕 GET request เพื่อดาวน์โหลดไฟล์
+        response = requests.get(
+            f"{STORAGE_API_URL}/{storage_path}", 
+            headers={"Authorization": f"Bearer {SUPABASE_KEY}"} # ใช้ Headers สำหรับ Auth เท่านั้น
+        )
+        response.raise_for_status()
+        return io.BytesIO(response.content)
+    except requests.exceptions.RequestException as e:
+        st.error(f"Error downloading file from Storage: {e}")
         return None
 
 
 def delete_file(file_id: int):
-    """ลบไฟล์ออกจาก Storage และลบ Metadata ออกจาก PostgreSQL"""
-    if conn is None or supabase_client is None: return
+    """ลบไฟล์ออกจาก Storage และลบ Metadata ออกจาก PostgreSQL ด้วย Requests"""
+    if conn is None or STORAGE_API_URL is None: return
         
     # 1. ดึง stored_path (Storage Path)
     df_path = conn.query("SELECT stored_path FROM uploads WHERE id = :id", params={"id": file_id}, ttl="1h")
@@ -146,14 +150,23 @@ def delete_file(file_id: int):
         
     storage_path = df_path['stored_path'].iloc[0]
 
-    # 2. ลบไฟล์จาก Supabase Storage
+    # 2. ลบไฟล์จาก Supabase Storage (Remove)
     try:
-        # การลบต้องใช้ list ของ path
-        supabase_client.storage.from_(BUCKET_NAME).remove([storage_path]) 
-    except Exception as e:
+        # 🆕 DELETE request ไปยัง Supabase Storage API
+        # Supabase API สำหรับลบต้องการ Body เป็น JSON array ของ path
+        response = requests.delete(
+            STORAGE_API_URL, 
+            headers={"Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
+            json={"prefixes": [storage_path]} 
+        )
+        response.raise_for_status()
+        if response.status_code != 200:
+             st.warning(f"Failed to delete file from Storage: HTTP {response.status_code}")
+        
+    except requests.exceptions.RequestException as e:
         st.warning(f"Failed to delete file from Storage: {e}. Metadata will still be removed.")
 
-    # 3. ลบ metadata จาก PostgreSQL
+    # 3. ลบ metadata จาก PostgreSQL 
     with conn.session as session:
         session.execute(text("DELETE FROM uploads WHERE id = :id"), params={"id": file_id})
         session.commit()
@@ -265,7 +278,7 @@ if menu == "หน้าแรก":
     )
     if files:
         if st.button("Upload", key=f"upload_btn_{chosen_date}"):
-            if supabase_client is None:
+            if STORAGE_API_URL is None:
                 st.error("Cannot upload. Supabase Storage client is not initialized.")
             else:
                 for file in files:
